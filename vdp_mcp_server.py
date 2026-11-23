@@ -11,9 +11,12 @@ and query the right tables behind the scenes:
   smart_dealer_locations  → location filter options
   smart_ga4_config        → GA4 sync status
   smart_vdp_logic         → VDP / SRP URL filtration patterns
-  smart_hoot_inventory    → live Hoot inventory
+  smart_hoot_inventory_live → live Hoot feed (SmartAnalytics Inventory)
+  smart_hoot_inventory    → Hoot warehouse inventory
   smart_scrap_inventory   → scrap inventory
-  smart_user_* / roles    → access (optional)
+  smart_vdp_logic         → URL rules (read + update)
+  smart_dealer_locations  → rooftops (read + CRUD)
+  smart_user_* / roles    → access (read + CRUD)
 
 Auth: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (RLS is on for most tables).
 
@@ -402,6 +405,74 @@ def _try_aggregate_sum(
         return None
 
 
+def _csv_list(value: str) -> Optional[list[str]]:
+    """Comma-separated filter list → list, or None when empty / BOTH / all."""
+    raw = (value or "").strip()
+    if not raw or raw.lower() in ("all", "both", "*"):
+        return None
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return parts or None
+
+
+def _csv_int_list(value: str) -> Optional[list[int]]:
+    parts = _csv_list(value)
+    if not parts:
+        return None
+    out: list[int] = []
+    for p in parts:
+        try:
+            out.append(int(str(p)[:4]))
+        except ValueError:
+            continue
+    return out or None
+
+
+def _rpc(name: str, params: dict[str, Any]) -> Any:
+    """Call a Smart Analytics Supabase RPC (same functions the web app uses)."""
+    return _client().rpc(name, params).execute().data
+
+
+def _vdp_rpc_filters(
+    *,
+    make: str = "",
+    model: str = "",
+    location: str = "",
+    year: str = "",
+    type_: str = "",
+    condition: str = "BOTH",
+    channel: str = "",
+) -> dict[str, Any]:
+    cond = (condition or "BOTH").strip().upper() or "BOTH"
+    if cond in ("ALL", "USED+NEW", "NEW+USED", ""):
+        cond = "BOTH"
+    return {
+        "p_types": _csv_list(type_),
+        "p_makes": _csv_list(make),
+        "p_models": _csv_list(model),
+        "p_locations": _csv_list(location),
+        "p_years": _csv_int_list(year),
+        "p_condition": cond,
+        "p_channels": _csv_list(channel),
+    }
+
+
+def _inventory_dealer_or_filter(name: str) -> str:
+    """PostgREST or_ clause matching SmartAnalytics dealer inventory naming."""
+    safe = name.replace(",", " ").replace("%", "").strip()
+    return f"customer_name.ilike.%{safe}%,advertiser.ilike.%{safe}%"
+
+
+def _count_inventory(table: str, *, dealer_name: str = "", **filters: str) -> int:
+    q = _client().table(table).select("sk", count="exact")
+    if dealer_name:
+        q = q.or_(_inventory_dealer_or_filter(dealer_name))
+    for col, val in filters.items():
+        if val and val.strip():
+            q = q.ilike(col, f"%{val.strip()}%")
+    res = q.limit(1).execute()
+    return int(res.count or 0)
+
+
 # ---------------------------------------------------------------------------
 # Tools — plain-language descriptions so the model never needs table names
 # ---------------------------------------------------------------------------
@@ -419,26 +490,33 @@ def help_vdp() -> str:
 DEALERS
 - "List my dealers" / "Find Beaver Coach"
 - "What locations does Moix RV have?"
+- "Add location Boise to Moix RV" / "Remove location …"
 
-VDP PERFORMANCE (Vehicle Detail Pages)
+VDP PERFORMANCE (same numbers as SmartAnalytics VDP report)
 - "VDP views for Moix RV last 7 days"
 - "Daily VDP trend for Zoomers RV from 2026-08-01 to 2026-08-17"
 - "Break down VDP by make / model / year / location / condition for …"
+- Optional filters: make, model, location, year, type, condition, channel
 
 TRAFFIC & CHANNELS
 - "Which channels drove VDP traffic for A&L RV?"
 - "Top VDP pages for Gerzeny’s RV last week"
 
-INVENTORY
-- "Search inventory for Forest River at Moix"
-- "Find VIN … in Hoot or scrap inventory"
+INVENTORY (same Hoot feed / daily snapshot as SmartAnalytics Inventory report)
+- "Inventory report for Moix RV"  ← preferred full report (units + $ + mix)
+- "Inventory summary by make for Beaver Coach"
+- "Search inventory for Forest River at Moix" (paginated — use offset)
+- "Find VIN … in live Hoot inventory"
+- source: live (default, matches SmartAnalytics) | hoot | scrap | both
 
-SETUP / RULES
-- "Show VDP URL rules for Beaver Coach"
+SETUP / RULES / ACCESS (CRUD where safe)
+- "Show / update VDP URL rules for Beaver Coach"
 - "Is GA4 sync healthy for Moix RV?"
+- "Who has access?" / "Grant user access" / "Remove user access"
 
 Use dealer *names* — you do not need client IDs or table names.
-Dates are YYYY-MM-DD (or yesterday / today)."""
+Dates are YYYY-MM-DD (or yesterday / today).
+Inventory writes are NOT available (feeds overwrite them); use SmartAnalytics sync jobs."""
 
 
 @mcp.tool()
@@ -521,12 +599,19 @@ def get_vdp_summary(
     dealer: str,
     start_date: str,
     end_date: str = "",
+    make: str = "",
+    model: str = "",
+    location: str = "",
+    year: str = "",
+    type_: str = "",
+    condition: str = "BOTH",
+    channel: str = "",
 ) -> str:
-    """Get VDP KPI totals for a dealer over a date range.
+    """Get VDP KPI totals for a dealer over a date range (SmartAnalytics parity).
 
-    Use for: VDP views, sessions, users, new users — the main VDP performance summary.
-    dealer: name or client id (e.g. "Moix RV").
-    start_date / end_date: YYYY-MM-DD. If end_date is blank, uses start_date only.
+    Uses the same get_vdp_views_total RPC as the SmartAnalytics VDP report when possible.
+    Optional filters (comma-separated): make, model, location, year, type_, condition, channel.
+    condition: BOTH | NEW | USED.
     """
     info = _resolve_dealer(dealer)
     cid = info["client_id"]
@@ -535,20 +620,56 @@ def get_vdp_summary(
     if end < start:
         start, end = end, start
 
+    inv = _vdp_rpc_filters(
+        make=make,
+        model=model,
+        location=location,
+        year=year,
+        type_=type_,
+        condition=condition,
+        channel=channel,
+    )
+    views: Optional[int] = None
+    source = "smart_final_data"
+    try:
+        total = _rpc(
+            "get_vdp_views_total",
+            {
+                "p_client_id": str(cid),
+                "p_from": start.isoformat(),
+                "p_to": end.isoformat(),
+                **inv,
+            },
+        )
+        if total is not None:
+            views = int(total if not isinstance(total, dict) else total.get("total") or total.get("get_vdp_views_total") or 0)
+            source = "get_vdp_views_total (SmartAnalytics)"
+    except Exception:
+        views = None
+
+    # Sessions / users still from smart_final_data (same table SmartAnalytics Step 3 writes)
     filters: list[tuple[str, str, Any]] = [
         ("eq", "client_id", cid),
         ("gte", "report_date", start.isoformat()),
         ("lte", "report_date", end.isoformat()),
     ]
+    if inv["p_makes"]:
+        filters.append(("ilike", "inv_make", f"%{inv['p_makes'][0]}%"))
+    if inv["p_models"]:
+        filters.append(("ilike", "inv_model", f"%{inv['p_models'][0]}%"))
+    if inv["p_locations"]:
+        filters.append(("ilike", "inv_location", f"%{inv['p_locations'][0]}%"))
 
     agg = _try_aggregate_sum(
         "smart_final_data",
         metrics=["views", "sessions", "total_users", "new_users"],
         filters=filters,
     )
+    sessions = users = new_users = 0
+    fallback_views = 0
     if agg is not None and agg:
         row = agg[0]
-        # aggregate aliases may be views, or sum nested
+
         def pick(r: dict, name: str) -> int:
             if name in r and not isinstance(r[name], dict):
                 return int(r[name] or 0)
@@ -559,7 +680,7 @@ def get_vdp_summary(
                     return int(v or 0)
             return 0
 
-        views = pick(row, "views")
+        fallback_views = pick(row, "views")
         sessions = pick(row, "sessions")
         users = pick(row, "total_users")
         new_users = pick(row, "new_users")
@@ -569,19 +690,39 @@ def get_vdp_summary(
             "views, sessions, total_users, new_users",
             filters=filters,
         )
-        views = _sum_field(rows, "views")
+        fallback_views = _sum_field(rows, "views")
         sessions = _sum_field(rows, "sessions")
         users = _sum_field(rows, "total_users")
         new_users = _sum_field(rows, "new_users")
 
+    if views is None:
+        views = fallback_views
+        source = "smart_final_data"
+
+    filter_note = []
+    for label, val in (
+        ("make", make),
+        ("model", model),
+        ("location", location),
+        ("year", year),
+        ("type", type_),
+        ("condition", condition if condition and condition.upper() != "BOTH" else ""),
+        ("channel", channel),
+    ):
+        if val and str(val).strip():
+            filter_note.append(f"{label}={val.strip()}")
+
     lines = [
         f"VDP summary — {info['customer_name']} ({cid})",
         f"Dates: {start.isoformat()} → {end.isoformat()}",
+        f"Source: {source}",
         f"Views: {_fmt_int(views)}",
         f"Sessions: {_fmt_int(sessions)}",
         f"Users: {_fmt_int(users)}",
         f"New users: {_fmt_int(new_users)}",
     ]
+    if filter_note:
+        lines.append("Filters: " + ", ".join(filter_note))
     if info.get("also_matched"):
         lines.append(f"Name match note: {info['also_matched']}")
     return "\n".join(lines)
@@ -592,10 +733,17 @@ def get_daily_trend(
     dealer: str,
     start_date: str,
     end_date: str = "",
+    make: str = "",
+    model: str = "",
+    location: str = "",
+    year: str = "",
+    type_: str = "",
+    condition: str = "BOTH",
+    channel: str = "",
 ) -> str:
-    """Daily VDP views / sessions / users for charting.
+    """Daily VDP views for charting (SmartAnalytics get_vdp_views_by_date when possible).
 
-    Use when the user wants a day-by-day trend or chart for a dealer.
+    Optional inventory filters match the SmartAnalytics VDP report.
     """
     info = _resolve_dealer(dealer)
     cid = info["client_id"]
@@ -604,53 +752,94 @@ def get_daily_trend(
     if end < start:
         start, end = end, start
 
+    inv = _vdp_rpc_filters(
+        make=make,
+        model=model,
+        location=location,
+        year=year,
+        type_=type_,
+        condition=condition,
+        channel=channel,
+    )
+    daily: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"views": 0, "sessions": 0, "users": 0}
+    )
+    used_rpc = False
+    try:
+        rows = _rpc(
+            "get_vdp_views_by_date",
+            {
+                "p_client_id": str(cid),
+                "p_from": start.isoformat(),
+                "p_to": end.isoformat(),
+                **inv,
+            },
+        ) or []
+        for r in rows:
+            d = str(r.get("report_date") or "")[:10]
+            if not d:
+                continue
+            daily[d]["views"] += int(r.get("views") or 0)
+        used_rpc = True
+    except Exception:
+        used_rpc = False
+
     filters: list[tuple[str, str, Any]] = [
         ("eq", "client_id", cid),
         ("gte", "report_date", start.isoformat()),
         ("lte", "report_date", end.isoformat()),
     ]
-
-    agg = _try_aggregate_sum(
-        "smart_final_data",
-        metrics=["views", "sessions", "total_users"],
-        filters=filters,
-        group_by="report_date",
-    )
-    daily: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"views": 0, "sessions": 0, "users": 0}
-    )
-    if agg is not None:
-        for r in agg:
-            d = str(r.get("report_date") or "")[:10]
-            if not d:
-                continue
-
-            def pick(name: str) -> int:
-                v = r.get(name)
-                if isinstance(v, dict):
-                    return int(v.get("sum") or 0)
-                if v is not None:
-                    return int(v or 0)
-                for k, val in r.items():
-                    if name in k.lower():
-                        if isinstance(val, dict):
-                            return int(val.get("sum") or 0)
-                        return int(val or 0)
-                return 0
-
-            daily[d]["views"] += pick("views")
-            daily[d]["sessions"] += pick("sessions")
-            daily[d]["users"] += pick("total_users")
-    else:
-        rows = _fetch_paged(
+    # Always fill sessions/users from smart_final_data; fill views if RPC failed
+    if not used_rpc:
+        agg = _try_aggregate_sum(
             "smart_final_data",
-            "report_date, views, sessions, total_users",
+            metrics=["views", "sessions", "total_users"],
+            filters=filters,
+            group_by="report_date",
+        )
+        if agg is not None:
+            for r in agg:
+                d = str(r.get("report_date") or "")[:10]
+                if not d:
+                    continue
+
+                def pick(name: str) -> int:
+                    v = r.get(name)
+                    if isinstance(v, dict):
+                        return int(v.get("sum") or 0)
+                    if v is not None:
+                        return int(v or 0)
+                    for k, val in r.items():
+                        if name in k.lower():
+                            if isinstance(val, dict):
+                                return int(val.get("sum") or 0)
+                            return int(val or 0)
+                    return 0
+
+                daily[d]["views"] += pick("views")
+                daily[d]["sessions"] += pick("sessions")
+                daily[d]["users"] += pick("total_users")
+        else:
+            for r in _fetch_paged(
+                "smart_final_data",
+                "report_date, views, sessions, total_users",
+                filters=filters,
+                order="report_date",
+            ):
+                d = str(r.get("report_date") or "")[:10]
+                daily[d]["views"] += int(r.get("views") or 0)
+                daily[d]["sessions"] += int(r.get("sessions") or 0)
+                daily[d]["users"] += int(r.get("total_users") or 0)
+    else:
+        # Sessions/users companion metrics from final data (unfiltered grain)
+        for r in _fetch_paged(
+            "smart_final_data",
+            "report_date, sessions, total_users",
             filters=filters,
             order="report_date",
-        )
-        for r in rows:
+            max_rows=5000,
+        ):
             d = str(r.get("report_date") or "")[:10]
-            daily[d]["views"] += int(r.get("views") or 0)
             daily[d]["sessions"] += int(r.get("sessions") or 0)
             daily[d]["users"] += int(r.get("total_users") or 0)
 
@@ -661,8 +850,9 @@ def get_daily_trend(
         [d, _fmt_int(v["views"]), _fmt_int(v["sessions"]), _fmt_int(v["users"])]
         for d, v in sorted(daily.items())
     ]
+    src = "get_vdp_views_by_date" if used_rpc else "smart_final_data"
     return (
-        f"Daily VDP trend — {info['customer_name']} ({cid})\n"
+        f"Daily VDP trend — {info['customer_name']} ({cid}) [{src}]\n"
         f"{start.isoformat()} → {end.isoformat()}\n"
         + _table_lines(["Date", "Views", "Sessions", "Users"], table)
     )
@@ -891,43 +1081,55 @@ def search_inventory(
     make: str = "",
     model: str = "",
     vin: str = "",
-    source: str = "both",
-    limit: int = 25,
+    stock: str = "",
+    condition: str = "",
+    location: str = "",
+    year: str = "",
+    source: str = "live",
+    offset: int = 0,
+    limit: int = 100,
 ) -> str:
-    """Search vehicle inventory (Hoot and/or scrap feeds).
+    """Search vehicle inventory with pagination (SmartAnalytics Hoot feed parity).
 
-    Use for: find vehicles by make/model/VIN, list stock for a dealer.
-    source: hoot | scrap | both.
-    dealer: optional dealer name (matches customer_name / advertiser).
+    Prefer source=live (smart_hoot_inventory_live — same live feed SmartAnalytics uses).
+    source: live | hoot | scrap | both | all
+    Use offset + limit to page through full stock (limit max 500). Response includes
+    total_matched and next_offset so you do NOT need to stitch by make.
     """
-    source = (source or "both").strip().lower()
-    lim = max(1, min(limit, 100))
-    blocks: list[str] = []
+    source = (source or "live").strip().lower()
+    lim = max(1, min(int(limit or 100), 500))
+    off = max(0, int(offset or 0))
+    dealer_name = ""
+    if dealer.strip():
+        try:
+            dealer_name = _resolve_dealer(dealer)["customer_name"]
+        except Exception:
+            dealer_name = dealer.strip()
 
-    def run(table: str, label: str) -> None:
+    filter_kwargs = {
+        "make": make,
+        "model": model,
+        "vin": vin,
+        "stock_number": stock,
+        "condition": condition,
+        "location": location,
+        "year": year,
+    }
+
+    def run(table: str, label: str) -> str:
+        total = _count_inventory(table, dealer_name=dealer_name, **filter_kwargs)
         q = _client().table(table).select(
-            "vin, make, model, year, trim, price, condition, location, "
+            "vin, make, model, year, trim, price, msrp, condition, location, "
             "stock_number, customer_name, advertiser, url, type_"
         )
-        if vin.strip():
-            q = q.ilike("vin", f"%{vin.strip()}%")
-        if make.strip():
-            q = q.ilike("make", f"%{make.strip()}%")
-        if model.strip():
-            q = q.ilike("model", f"%{model.strip()}%")
-        if dealer.strip():
-            # Prefer customer_name; also try advertiser
-            info = None
-            try:
-                info = _resolve_dealer(dealer)
-                name = info["customer_name"]
-            except Exception:
-                name = dealer.strip()
-            q = q.or_(f"customer_name.ilike.%{name}%,advertiser.ilike.%{name}%")
-        rows = q.limit(lim).execute().data or []
+        if dealer_name:
+            q = q.or_(_inventory_dealer_or_filter(dealer_name))
+        for col, val in filter_kwargs.items():
+            if val and str(val).strip():
+                q = q.ilike(col, f"%{str(val).strip()}%")
+        rows = q.range(off, off + lim - 1).execute().data or []
         if not rows:
-            blocks.append(f"{label}: no matches.")
-            return
+            return f"{label}: no matches (total_matched={total}, offset={off})."
         table_rows = [
             [
                 r.get("year") or "",
@@ -935,15 +1137,22 @@ def search_inventory(
                 r.get("model") or "",
                 r.get("trim") or "",
                 r.get("condition") or "",
-                r.get("price") if r.get("price") is not None else "",
+                r.get("price") if r.get("price") is not None else (r.get("msrp") or ""),
                 r.get("vin") or "",
+                r.get("stock_number") or "",
                 r.get("location") or "",
                 r.get("customer_name") or r.get("advertiser") or "",
             ]
             for r in rows
         ]
-        blocks.append(
-            f"{label} ({len(rows)} row(s))\n"
+        next_off = off + len(rows)
+        more = next_off < total
+        footer = (
+            f"Showing {off + 1}–{off + len(rows)} of {total}. "
+            + (f"Next page: offset={next_off}, limit={lim}" if more else "End of results.")
+        )
+        return (
+            f"{label} — {len(rows)} row(s) this page | total_matched={total}\n"
             + _table_lines(
                 [
                     "Year",
@@ -953,20 +1162,432 @@ def search_inventory(
                     "Cond",
                     "Price",
                     "VIN",
+                    "Stock",
                     "Location",
                     "Dealer",
                 ],
                 table_rows,
             )
+            + "\n"
+            + footer
         )
 
+    blocks: list[str] = []
+    if source in ("live", "both", "all"):
+        blocks.append(run("smart_hoot_inventory_live", "Live Hoot inventory (SmartAnalytics feed)"))
     if source in ("hoot", "both", "all"):
-        run("smart_hoot_inventory", "Hoot inventory")
+        blocks.append(run("smart_hoot_inventory", "Hoot inventory (warehouse)"))
     if source in ("scrap", "both", "all"):
-        run("smart_scrap_inventory", "Scrap inventory")
+        blocks.append(run("smart_scrap_inventory", "Scrap inventory"))
     if not blocks:
-        return "source must be hoot, scrap, or both."
+        return "source must be live, hoot, scrap, both, or all."
     return "\n\n".join(blocks)
+
+
+@mcp.tool()
+def get_inventory_summary(
+    dealer: str,
+    by: str = "make",
+    source: str = "live",
+    limit: int = 50,
+) -> str:
+    """Inventory mix counts (units) like SmartAnalytics Inventory report sections.
+
+    by: make | model | condition | location | type | year
+    source: live (default) | hoot | scrap
+    Prefer get_inventory_report for the full SmartAnalytics snapshot report.
+    """
+    info = _resolve_dealer(dealer)
+    name = info["customer_name"]
+    dim_map = {
+        "make": "make",
+        "model": "model",
+        "condition": "condition",
+        "location": "location",
+        "type": "type_",
+        "year": "year",
+    }
+    col = dim_map.get((by or "make").strip().lower())
+    if not col:
+        return "by must be make|model|condition|location|type|year"
+
+    src = (source or "live").strip().lower()
+    table = {
+        "live": "smart_hoot_inventory_live",
+        "hoot": "smart_hoot_inventory",
+        "scrap": "smart_scrap_inventory",
+    }.get(src)
+    if not table:
+        return "source must be live, hoot, or scrap"
+
+    buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {"units": 0, "value": 0.0})
+    start = 0
+    page = 1000
+    while start < 50000:
+        q = (
+            _client()
+            .table(table)
+            .select(f"{col}, price, msrp")
+            .or_(_inventory_dealer_or_filter(name))
+        )
+        batch = q.range(start, start + page - 1).execute().data or []
+        for r in batch:
+            label = str(r.get(col) or "(blank)")
+            buckets[label]["units"] += 1
+            price = r.get("price") or r.get("msrp") or 0
+            try:
+                buckets[label]["value"] += float(price or 0)
+            except (TypeError, ValueError):
+                pass
+        if len(batch) < page:
+            break
+        start += page
+
+    if not buckets:
+        return f"No inventory for {name} in {table}."
+
+    ranked = sorted(buckets.items(), key=lambda kv: kv[1]["units"], reverse=True)
+    ranked = ranked[: max(1, min(limit, 200))]
+    total_units = sum(v["units"] for _, v in buckets.items())
+    table_rows = [
+        [
+            label,
+            _fmt_int(v["units"]),
+            f"{(v['units'] / total_units * 100):.1f}%" if total_units else "0%",
+            f"${v['value']:,.0f}",
+        ]
+        for label, v in ranked
+    ]
+    return (
+        f"Inventory by {by} — {name} ({info['client_id']}) [{table}]\n"
+        f"Total units: {_fmt_int(total_units)}\n"
+        + _table_lines(["Label", "Units", "Share", "Value"], table_rows)
+    )
+
+
+@mcp.tool()
+def get_inventory_report(
+    dealer: str = "",
+    report_date: str = "",
+    make: str = "",
+    model: str = "",
+    location: str = "",
+    year: str = "",
+    type_: str = "",
+    condition: str = "BOTH",
+    list_limit: int = 100,
+) -> str:
+    """Full SmartAnalytics Inventory report (same get_inventory_report RPC as the web UI).
+
+    Reads the daily Hoot/scrap snapshot SmartAnalytics uses — units, $ value, and
+    condition/location/make/type mix. dealer blank = all dealers.
+    report_date: YYYY-MM-DD (default today / latest snapshot).
+    """
+    cid = None
+    dealer_label = "All dealers"
+    if dealer.strip():
+        info = _resolve_dealer(dealer)
+        cid = str(info["client_id"])
+        dealer_label = f"{info['customer_name']} ({cid})"
+
+    rd = _parse_date(report_date, default=date.today()) if report_date.strip() else date.today()
+    cond = (condition or "BOTH").strip().upper() or "BOTH"
+    if cond in ("ALL", "USED+NEW", "NEW+USED"):
+        cond = "BOTH"
+
+    def _call_report(day: date) -> Any:
+        return _rpc(
+            "get_inventory_report",
+            {
+                "p_client_id": cid,
+                "p_report_date": day.isoformat(),
+                "p_types": _csv_list(type_),
+                "p_makes": _csv_list(make),
+                "p_models": _csv_list(model),
+                "p_locations": _csv_list(location),
+                "p_years": _csv_int_list(year),
+                "p_condition": cond,
+            },
+        )
+
+    def _normalize_raw(payload: Any) -> dict:
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _report_units(payload: dict) -> int:
+        inv = payload.get("inventoryList") or {}
+        if isinstance(inv, dict):
+            try:
+                return int(inv.get("totalUnits") or 0)
+            except (TypeError, ValueError):
+                return 0
+        meta = payload.get("meta") or {}
+        try:
+            return int(meta.get("rowCount") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        raw = _normalize_raw(_call_report(rd))
+    except Exception as e:
+        return f"Inventory report RPC failed: {e}"
+
+    # If today's snapshot is empty / not ready, fall back to latest daily pull_date.
+    if (not raw or raw.get("ready") is False or _report_units(raw) == 0) and not report_date.strip():
+        try:
+            latest = (
+                _client()
+                .table("smart_hoot_inventory_daily")
+                .select("pull_date")
+                .order("pull_date", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if latest and latest[0].get("pull_date"):
+                fallback_day = _parse_date(str(latest[0]["pull_date"])[:10])
+                if fallback_day != rd:
+                    alt = _normalize_raw(_call_report(fallback_day))
+                    if alt and (alt.get("ready") is not False) and _report_units(alt) > 0:
+                        raw = alt
+                        rd = fallback_day
+        except Exception:
+            pass
+
+    use_live_fallback = (
+        dealer.strip()
+        and (not raw or raw.get("ready") is False or _report_units(raw) == 0)
+    )
+    if use_live_fallback:
+        # Same live Hoot feed SmartAnalytics syncs from when daily snapshot misses a dealer.
+        return (
+            get_inventory_summary(dealer=dealer, by="make", source="live", limit=40)
+            + "\n\n(Note: SmartAnalytics get_inventory_report had no daily snapshot for this "
+            "dealer/date — showing live Hoot feed instead, same source as SmartAnalytics live inventory.)"
+        )
+
+    if not raw:
+        return f"No inventory report data for {dealer_label} on {rd.isoformat()}."
+    if raw.get("ready") is False:
+        return (
+            f"Inventory report not ready for {dealer_label} on {rd.isoformat()}. "
+            f"Try an earlier report_date, or use get_inventory_summary / search_inventory (live)."
+        )
+
+    meta = raw.get("meta") or {}
+    sections = raw.get("sections") or {}
+    inv_list = raw.get("inventoryList") or {}
+    list_rows = inv_list.get("rows") if isinstance(inv_list, dict) else []
+    if not isinstance(list_rows, list):
+        list_rows = []
+
+    parts = [
+        f"Inventory report — {dealer_label}",
+        f"Requested: {rd.isoformat()} | pull_date: {meta.get('pullDate') or meta.get('requestedDate') or rd.isoformat()}",
+        f"Source: {meta.get('inventorySource') or meta.get('source') or 'daily snapshot'} | "
+        f"units={_fmt_int(inv_list.get('totalUnits') if isinstance(inv_list, dict) else meta.get('rowCount'))} | "
+        f"value=${float((inv_list.get('totalValue') if isinstance(inv_list, dict) else 0) or 0):,.0f}",
+    ]
+
+    for section_key in ("condition", "make", "location", "type"):
+        sec = sections.get(section_key) or {}
+        rows = sec.get("rows") or []
+        if not rows:
+            continue
+        body = [
+            [
+                r.get("label") or "(blank)",
+                _fmt_int(r.get("units")),
+                f"${float(r.get('totalValue') or 0):,.0f}",
+            ]
+            for r in rows[:40]
+        ]
+        parts.append(
+            f"\nBy {section_key} (total units {_fmt_int(sec.get('totalUnits'))})\n"
+            + _table_lines(["Label", "Units", "Value"], body)
+        )
+
+    lim = max(1, min(int(list_limit or 100), 500))
+    if list_rows:
+        body = [
+            [
+                r.get("manufacturer") or "",
+                r.get("brandModel") or "",
+                r.get("condition") or "",
+                _fmt_int(r.get("units")),
+                f"${float(r.get('totalValue') or 0):,.0f}",
+                f"${float(r.get('averagePrice') or 0):,.0f}",
+            ]
+            for r in list_rows[:lim]
+        ]
+        parts.append(
+            f"\nInventory list (first {min(lim, len(list_rows))} of {len(list_rows)} groups)\n"
+            + _table_lines(
+                ["Make", "Model", "Cond", "Units", "Value", "Avg $"],
+                body,
+            )
+        )
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def upsert_dealer_location(dealer: str, location_name: str) -> str:
+    """Create or keep a rooftop/location for a dealer (CRUD — write).
+
+    Same smart_dealer_locations table SmartAnalytics location filters use.
+    """
+    info = _resolve_dealer(dealer)
+    loc = (location_name or "").strip()
+    if not loc:
+        return "location_name is required."
+    cid = str(info["client_id"])
+    existing = (
+        _client()
+        .table("smart_dealer_locations")
+        .select("id, location_name, customer_id")
+        .eq("customer_id", cid)
+        .ilike("location_name", loc)
+        .limit(5)
+        .execute()
+        .data
+        or []
+    )
+    exact = [r for r in existing if (r.get("location_name") or "").lower() == loc.lower()]
+    if exact:
+        return f"Location already exists: {exact[0].get('location_name')} (client {cid})"
+    _client().table("smart_dealer_locations").insert(
+        {"customer_id": cid, "location_name": loc}
+    ).execute()
+    return f"Added location '{loc}' for {info['customer_name']} ({cid})."
+
+
+@mcp.tool()
+def delete_dealer_location(dealer: str, location_name: str) -> str:
+    """Delete a rooftop/location for a dealer (CRUD — delete)."""
+    info = _resolve_dealer(dealer)
+    loc = (location_name or "").strip()
+    if not loc:
+        return "location_name is required."
+    cid = str(info["client_id"])
+    res = (
+        _client()
+        .table("smart_dealer_locations")
+        .delete()
+        .eq("customer_id", cid)
+        .ilike("location_name", loc)
+        .execute()
+    )
+    deleted = res.data or []
+    if not deleted:
+        return f"No location matching '{loc}' for {info['customer_name']}."
+    return f"Deleted {len(deleted)} location row(s) matching '{loc}' for {info['customer_name']}."
+
+
+@mcp.tool()
+def update_page_rules(
+    dealer: str,
+    vdp_logic: str = "",
+    srp_logic: str = "",
+    home_page_logic: str = "",
+    others: str = "",
+    hoot_link: str = "",
+    scrap_link: str = "",
+) -> str:
+    """Update VDP/SRP/homepage URL rules for a dealer (CRUD — update).
+
+    Only fields you pass (non-empty) are updated on smart_vdp_logic.
+    """
+    info = _resolve_dealer(dealer)
+    name = info["customer_name"]
+    cid = str(info["client_id"])
+    patch: dict[str, Any] = {}
+    if vdp_logic.strip():
+        patch["vdp_logic"] = vdp_logic.strip()
+    if srp_logic.strip():
+        patch["srp_logic"] = srp_logic.strip()
+    if home_page_logic.strip():
+        patch["home_page_logic"] = home_page_logic.strip()
+    if others.strip():
+        patch["others"] = others.strip()
+    if hoot_link.strip():
+        patch["hoot_link"] = hoot_link.strip()
+    if scrap_link.strip():
+        patch["scrap_link"] = scrap_link.strip()
+    if not patch:
+        return "Provide at least one field to update (vdp_logic, srp_logic, home_page_logic, others, hoot_link, scrap_link)."
+
+    rows = (
+        _client()
+        .table("smart_vdp_logic")
+        .select("id, dealer_name, dealer_id")
+        .or_(f"dealer_id.eq.{cid},dealer_name.ilike.%{name}%")
+        .limit(5)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return f"No smart_vdp_logic row for {name}. Create one in SmartAnalytics admin first."
+    ids = [r["id"] for r in rows if r.get("id") is not None]
+    _client().table("smart_vdp_logic").update(patch).in_("id", ids).execute()
+    return (
+        f"Updated page rules for {name} (rows {ids}).\n"
+        f"Fields: {', '.join(patch.keys())}"
+    )
+
+
+@mcp.tool()
+def upsert_user_access(
+    email: str,
+    role_key: str = "user",
+    all_reports: bool = False,
+    all_dealers: bool = False,
+) -> str:
+    """Create or update a SmartAnalytics user role row (CRUD — write).
+
+    role_key examples: admin, user, viewer (whatever your smart_roles uses).
+    """
+    em = (email or "").strip().lower()
+    if not em or "@" not in em:
+        return "Valid email is required."
+    role = (role_key or "user").strip() or "user"
+    existing = (
+        _client()
+        .table("smart_user_roles")
+        .select("email, role_key")
+        .eq("email", em)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    payload = {
+        "email": em,
+        "role_key": role,
+        "all_reports": bool(all_reports),
+        "all_dealers": bool(all_dealers),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    if existing:
+        _client().table("smart_user_roles").update(payload).eq("email", em).execute()
+        return f"Updated access for {em}: role={role}, all_reports={all_reports}, all_dealers={all_dealers}"
+    _client().table("smart_user_roles").insert(payload).execute()
+    return f"Created access for {em}: role={role}, all_reports={all_reports}, all_dealers={all_dealers}"
+
+
+@mcp.tool()
+def delete_user_access(email: str) -> str:
+    """Remove a user role assignment (CRUD — delete)."""
+    em = (email or "").strip().lower()
+    if not em:
+        return "email is required."
+    res = _client().table("smart_user_roles").delete().eq("email", em).execute()
+    n = len(res.data or [])
+    if not n:
+        return f"No smart_user_roles row for {em}."
+    return f"Deleted access for {em} ({n} row(s))."
 
 
 @mcp.tool()
@@ -1164,15 +1785,22 @@ if __name__ == "__main__":
         "help_vdp",
         "list_dealers",
         "list_locations",
+        "upsert_dealer_location",
+        "delete_dealer_location",
         "get_vdp_summary",
         "get_daily_trend",
         "get_vdp_breakdown",
         "get_channel_mix",
         "get_top_pages",
         "search_inventory",
+        "get_inventory_summary",
+        "get_inventory_report",
         "get_page_rules",
+        "update_page_rules",
         "get_ga4_sync_status",
         "list_user_access",
+        "upsert_user_access",
+        "delete_user_access",
     ]
     print("Tools: " + ", ".join(tools), file=sys.stderr, flush=True)
 

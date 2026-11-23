@@ -154,7 +154,11 @@ If you still see *“Couldn't register with … sign-in service”* (`ofid_…`)
 - "Break down VDP by make for Beaver Coach Sales"
 - "Which channels drove VDP traffic for A&L RV?"
 - "Top VDP pages for Gerzeny’s RV"
-- "Search inventory for Forest River at Moix"
+- "Inventory report for Moix RV" (same RPC as SmartAnalytics Inventory)
+- "Inventory summary by make for Beaver Coach"
+- "Search live inventory for Forest River at Moix" (paginated — use offset)
+- "Add location Boise for Moix RV"
+- "Update VDP URL rules for Beaver Coach"
 - "Show VDP URL rules for Beaver Coach"
 - "Is GA4 sync OK for Moix RV?"
 
@@ -165,12 +169,21 @@ If you still see *“Couldn't register with … sign-in service”* (`ofid_…`)
 | `help_vdp` | What you can ask |
 | `list_dealers` | Find dealers by name/category |
 | `list_locations` | Rooftops / locations |
-| `get_vdp_summary` | VDP KPI totals |
-| `get_daily_trend` | Day-by-day VDP chart data |
+| `upsert_dealer_location` | Create location (CRUD) |
+| `delete_dealer_location` | Delete location (CRUD) |
+| `get_vdp_summary` | VDP KPI totals (SmartAnalytics `get_vdp_views_total`) |
+| `get_daily_trend` | Day-by-day VDP (`get_vdp_views_by_date`) |
 | `get_vdp_breakdown` | By location / make / model / year / type / condition |
 | `get_channel_mix` | Channel / traffic mix |
 | `get_top_pages` | Top paths & titles |
-| `search_inventory` | Hoot + scrap inventory |
+| `search_inventory` | Paginated live/hoot/scrap inventory (offset + limit) |
+| `get_inventory_summary` | Units/value mix by make/condition/… |
+| `get_inventory_report` | Full SmartAnalytics Inventory report RPC |
 | `get_page_rules` | VDP/SRP filtration logic |
+| `update_page_rules` | Update URL rules (CRUD) |
 | `get_ga4_sync_status` | Sync health |
 | `list_user_access` | Role assignments |
+| `upsert_user_access` | Create/update user role (CRUD) |
+| `delete_user_access` | Remove user role (CRUD) |
+
+**Not writable via connector:** inventory feeds and `smart_final_data` (owned by SmartAnalytics sync pipelines).
